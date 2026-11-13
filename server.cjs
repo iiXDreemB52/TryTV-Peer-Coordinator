@@ -73,7 +73,7 @@ function broker(){
   let u;try{u=new URL(req.url,'http://localhost')}catch{send(res,400,'Invalid path');return}
   if(req.method!=='GET'||u.searchParams.size>0){send(res,404,'Not found');return}
   if(u.pathname==='/healthz'){send(res,200,JSON.stringify({ok:true,service:'trytv-peer-coordinator',storedBundles:0}),{'content-type':'application/json'});return}
-  if(u.pathname==='/status'){send(res,200,JSON.stringify({schema:1,peerCount:participants('peer').length,ownerOnline:participants('owner').length>0,activeTransfers:pending.size,storedBundles:0}),{'content-type':'application/json'});return}
+  if(u.pathname==='/status'){send(res,200,JSON.stringify({schema:1,peerCount:participants('peer').length,ownerOnline:participants('owner').length>0,activeTransfers:pending.size,storedBundles:0}),{'content-type':'application/json','access-control-allow-origin':'*'});return}
   if(u.pathname==='/participants'){send(res,200,JSON.stringify({schema:1,ids:participants('peer').map(c=>c.id).slice(0,MAX_PEERS),ttlSeconds:60}),{'content-type':'application/json'});return}
   const m=/^\/v2\/(p2p|owner)\/(.+)$/.exec(u.pathname);
   if(!m||!allowed(m[2])){send(res,404,'Not found');return}
