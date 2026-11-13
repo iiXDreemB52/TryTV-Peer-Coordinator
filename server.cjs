@@ -4,6 +4,7 @@
 // WebSocket is a transient data path; GitHub remains fail-safe.
 const http=require('node:http'),crypto=require('node:crypto');
 const {WebSocket,WebSocketServer}=require('ws');
+const {createIntake}=require('./community-playback-intake.cjs');
 const PUBLIC_KEY=crypto.createPublicKey({key:Buffer.from('MCowBQYDK2VwAyEABh5+fCf15Kjd8/WF6zkkDS10V0vpATtIuTFLDW7zFac=','base64'),format:'der',type:'spki'});
 const HINT_LIMIT=128*1024;
 const MAX=12*1024*1024,MAX64=17*1024*1024,MAX_PEERS=200,ID=/^[a-f0-9]{16}$/,QID=/^[a-f0-9-]{36}$/;
@@ -20,6 +21,7 @@ function send(res,status,body,headers={}){
 }
 function broker(){
  const clients=new Map(),pending=new Map(),rates=new Map();
+ const communityPlayback=createIntake();
  let seq=0,totalBytes=0;
  const participants=(role)=>[...clients.values()].filter(p=>p.authenticated&&p.role===role&&p.ws.readyState===WebSocket.OPEN);
  function finish(qid,status,payload){
@@ -73,6 +75,7 @@ function broker(){
   ws.on('close',closed);ws.on('error',()=>{});
  });
  const server=http.createServer((req,res)=>{
+  if(communityPlayback.handle(req,res,clientIp(req)))return;
   let u;try{u=new URL(req.url,'http://localhost')}catch{send(res,400,'Invalid path');return}
   if(req.method!=='GET'||u.searchParams.size>0){send(res,404,'Not found');return}
   if(u.pathname==='/healthz'){send(res,200,JSON.stringify({ok:true,service:'trytv-peer-coordinator',storedBundles:0}),{'content-type':'application/json'});return}
@@ -103,7 +106,14 @@ function broker(){
   if(clients.size>=MAX_PEERS+3||role==='peer'&&participants('peer').filter(c=>c.ip===ip).length>=30||role==='owner'&&participants('owner').length>=2){socket.destroy();return}
   wss.handleUpgrade(req,socket,head,ws=>wss.emit('connection',ws,req,{role,id,ip}));
  });
- return {server,wss,status:()=>({peers:participants('peer').length,owner:participants('owner').length,bytes:totalBytes}),close:()=>new Promise(resolve=>{for(const x of clients.keys())x.terminate();server.close(resolve)})};
+ return {server,wss,
+  status:()=>({peers:participants('peer').length,owner:participants('owner').length,bytes:totalBytes}),
+  communityPlayback,
+  close:async()=>{
+   await communityPlayback.close();
+   for(const x of clients.keys())x.terminate();
+   await new Promise(resolve=>server.close(resolve));
+  }};
 }
 if(require.main===module){
  const b=broker(),port=Number(process.env.PORT||3000);
