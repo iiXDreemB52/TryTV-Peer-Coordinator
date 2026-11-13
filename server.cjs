@@ -5,8 +5,9 @@
 const http=require('node:http'),crypto=require('node:crypto');
 const {WebSocket,WebSocketServer}=require('ws');
 const PUBLIC_KEY=crypto.createPublicKey({key:Buffer.from('MCowBQYDK2VwAyEABh5+fCf15Kjd8/WF6zkkDS10V0vpATtIuTFLDW7zFac=','base64'),format:'der',type:'spki'});
+const HINT_LIMIT=128*1024;
 const MAX=12*1024*1024,MAX64=17*1024*1024,MAX_PEERS=200,ID=/^[a-f0-9]{16}$/,QID=/^[a-f0-9-]{36}$/;
-const allowed=s=>s==='directory.json'||/^packs\/[a-f0-9]{64}\/(?:manifest\.json|snapshot-[1-9]\d*\.json\.gz)$/.test(s);
+const allowed=s=>s==='candidates.json'||s==='directory.json'||/^packs\/[a-f0-9]{64}\/(?:manifest\.json|snapshot-[1-9]\d*\.json\.gz)$/.test(s);
 // Render is the sole trusted HTTPS reverse proxy. Prefer its last forwarded
 // client address for fair per-client quotas under shared NAT connections.
 function clientIp(req){
@@ -30,7 +31,7 @@ function broker(){
  }
  const wss=new WebSocketServer({noServer:true,maxPayload:MAX64+500,perMessageDeflate:false});
  wss.on('connection',(ws,req,meta)=>{
-  const c={ws,role:meta.role,id:meta.id,ip:meta.ip,authenticated:meta.role==='peer',offers:new Set(),inflight:0,quotaAt:Date.now(),bytes:0,nonce:'',guard:null};
+  const c={ws,role:meta.role,id:meta.id,ip:meta.ip,authenticated:meta.role==='peer',offers:new Set(),offersCandidates:false,inflight:0,quotaAt:Date.now(),bytes:0,nonce:'',guard:null};
   clients.set(ws,c);
   if(c.role==='owner'){
    c.nonce=crypto.randomUUID()+'-'+crypto.randomUUID();
@@ -51,16 +52,18 @@ function broker(){
    if(c.role==='peer'&&msg?.op==='offer'){
     if(!Array.isArray(msg.hashes)||msg.hashes.length>80)return;
     c.offers=new Set(msg.hashes.filter(x=>typeof x==='string'&&/^[a-f0-9]{64}$/.test(x)));
+    c.offersCandidates=msg.candidates===true;
     return;
    }
    if(msg?.op!=='asset'||!QID.test(String(msg.qid||'')))return;
    const task=pending.get(msg.qid);if(!task||task.client!==c)return;
+   if(task.suffix==='candidates.json'&&typeof msg.body==='string'&&msg.body.length>HINT_LIMIT*2){finish(msg.qid,413,null);return}
    if(msg.status!==200){finish(msg.qid,404,null);return}
    if(typeof msg.body!=='string'||msg.body.length>MAX64||!/^[a-zA-Z0-9+/]*={0,2}$/.test(msg.body)){finish(msg.qid,422,null);return}
    try{
     const bytes=Buffer.from(msg.body,'base64');
     const now=Date.now();if(now-c.quotaAt>60000){c.quotaAt=now;c.bytes=0}
-    if(bytes.length<1||bytes.length>MAX||c.bytes+bytes.length>32*1024*1024){finish(msg.qid,429,null);return}
+    if(bytes.length<1||bytes.length>MAX||task.suffix==='candidates.json'&&bytes.length>HINT_LIMIT||c.bytes+bytes.length>32*1024*1024){finish(msg.qid,429,null);return}
     c.bytes+=bytes.length;totalBytes+=bytes.length;finish(msg.qid,200,bytes);
    }catch{finish(msg.qid,422,null)}
   });
@@ -73,21 +76,21 @@ function broker(){
   let u;try{u=new URL(req.url,'http://localhost')}catch{send(res,400,'Invalid path');return}
   if(req.method!=='GET'||u.searchParams.size>0){send(res,404,'Not found');return}
   if(u.pathname==='/healthz'){send(res,200,JSON.stringify({ok:true,service:'trytv-peer-coordinator',storedBundles:0}),{'content-type':'application/json'});return}
-  if(u.pathname==='/status'){send(res,200,JSON.stringify({schema:1,peerCount:participants('peer').length,ownerOnline:participants('owner').length>0,activeTransfers:pending.size,storedBundles:0}),{'content-type':'application/json','access-control-allow-origin':'*'});return}
+  if(u.pathname==='/status'){send(res,200,JSON.stringify({schema:1,peerCount:participants('peer').length,ownerOnline:participants('owner').length>0,candidateProviders:participants('peer').filter(p=>p.offersCandidates).length,activeTransfers:pending.size,storedBundles:0}),{'content-type':'application/json','access-control-allow-origin':'*'});return}
   if(u.pathname==='/participants'){send(res,200,JSON.stringify({schema:1,ids:participants('peer').map(c=>c.id).slice(0,MAX_PEERS),ttlSeconds:60}),{'content-type':'application/json'});return}
   const m=/^\/v2\/(p2p|owner)\/(.+)$/.exec(u.pathname);
-  if(!m||!allowed(m[2])){send(res,404,'Not found');return}
+  if(!m||!allowed(m[2])||m[1]==='owner'&&m[2]==='candidates.json'){send(res,404,'Not found');return}
   const ip=clientIp(req),now=Date.now();
   const b=rates.get(ip);if(b&&now-b.time<60000){if(b.count>=35){send(res,429,'Rate limit');return}b.count++}
   else rates.set(ip,{time:now,count:1});
   if(rates.size>1000)for(const [k,v] of rates)if(now-v.time>60000)rates.delete(k);
   if(pending.size>=45){send(res,429,'Busy');return}
   const hash=/^packs\/([a-f0-9]{64})\//.exec(m[2])?.[1];
-  const list=participants(m[1]==='owner'?'owner':'peer').filter(c=>c.inflight<3&&(!hash||c.role==='owner'||c.offers.has(hash)));
+  const list=participants(m[1]==='owner'?'owner':'peer').filter(c=>c.inflight<3&&(!hash||c.role==='owner'||c.offers.has(hash))&&(m[2]!=='candidates.json'||c.role==='peer'&&c.offersCandidates));
   if(!list.length){send(res,404,'No provider');return}
   const c=list[(seq++)%list.length],qid=crypto.randomUUID();
   const timer=setTimeout(()=>finish(qid,504,null),4700);
-  c.inflight++;pending.set(qid,{res,client:c,timer});
+  c.inflight++;pending.set(qid,{res,client:c,timer,suffix:m[2]});
   res.on('close',()=>{if(!res.writableEnded)finish(qid,499,null)});
   try{c.ws.send(JSON.stringify({op:'get',qid,suffix:m[2]}))}catch{finish(qid,503,null)}
  });
