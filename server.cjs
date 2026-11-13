@@ -7,6 +7,13 @@ const {WebSocket,WebSocketServer}=require('ws');
 const PUBLIC_KEY=crypto.createPublicKey({key:Buffer.from('MCowBQYDK2VwAyEABh5+fCf15Kjd8/WF6zkkDS10V0vpATtIuTFLDW7zFac=','base64'),format:'der',type:'spki'});
 const MAX=12*1024*1024,MAX64=17*1024*1024,MAX_PEERS=200,ID=/^[a-f0-9]{16}$/,QID=/^[a-f0-9-]{36}$/;
 const allowed=s=>s==='directory.json'||/^packs\/[a-f0-9]{64}\/(?:manifest\.json|snapshot-[1-9]\d*\.json\.gz)$/.test(s);
+// Render is the sole trusted HTTPS reverse proxy. Prefer its last forwarded
+// client address for fair per-client quotas under shared NAT connections.
+function clientIp(req){
+ const forwarded=String(req.headers['x-forwarded-for']||'').split(',').pop().trim();
+ return /^[0-9a-fA-F:.]{3,64}$/.test(forwarded)?forwarded:
+  String(req.socket.remoteAddress||'unknown');
+}
 function send(res,status,body,headers={}){
  if(res.writableEnded)return;res.writeHead(status,{'cache-control':'no-store','x-content-type-options':'nosniff',...headers});res.end(body);
 }
@@ -70,7 +77,7 @@ function broker(){
   if(u.pathname==='/participants'){send(res,200,JSON.stringify({schema:1,ids:participants('peer').map(c=>c.id).slice(0,MAX_PEERS),ttlSeconds:60}),{'content-type':'application/json'});return}
   const m=/^\/v2\/(p2p|owner)\/(.+)$/.exec(u.pathname);
   if(!m||!allowed(m[2])){send(res,404,'Not found');return}
-  const ip=String(req.socket.remoteAddress||'unknown'),now=Date.now();
+  const ip=clientIp(req),now=Date.now();
   const b=rates.get(ip);if(b&&now-b.time<60000){if(b.count>=35){send(res,429,'Rate limit');return}b.count++}
   else rates.set(ip,{time:now,count:1});
   if(rates.size>1000)for(const [k,v] of rates)if(now-v.time>60000)rates.delete(k);
@@ -89,8 +96,8 @@ function broker(){
   if(u.pathname!=='/connect'||u.searchParams.size!==2){socket.destroy();return}
   const role=u.searchParams.get('role'),id=u.searchParams.get('id');
   if(!['peer','owner'].includes(role)||!ID.test(id||'')){socket.destroy();return}
-  const ip=String(req.socket.remoteAddress||'unknown');
-  if(clients.size>=MAX_PEERS+3||role==='peer'&&participants('peer').filter(c=>c.ip===ip).length>=5||role==='owner'&&participants('owner').length>=2){socket.destroy();return}
+  const ip=clientIp(req);
+  if(clients.size>=MAX_PEERS+3||role==='peer'&&participants('peer').filter(c=>c.ip===ip).length>=30||role==='owner'&&participants('owner').length>=2){socket.destroy();return}
   wss.handleUpgrade(req,socket,head,ws=>wss.emit('connection',ws,req,{role,id,ip}));
  });
  return {server,wss,status:()=>({peers:participants('peer').length,owner:participants('owner').length,bytes:totalBytes}),close:()=>new Promise(resolve=>{for(const x of clients.keys())x.terminate();server.close(resolve)})};
